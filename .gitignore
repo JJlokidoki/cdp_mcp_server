@@ -1,0 +1,7 @@
+__pycache__/
+*.log
+*.log.*
+build/
+dist/
+*.spec
+chrome_user_data/
