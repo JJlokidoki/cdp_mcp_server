@@ -16,6 +16,10 @@ mcp_launcher.py — интерактивный лаунчер Chrome (CDP) + MCP
 конфиг-файл (по умолчанию mcp_launcher.json рядом со скриптом) и
 загружаются при следующем запуске.
 
+chrome_lazy (по умолчанию on): Chrome не держится запущенным постоянно, а
+стартует при первом вызове инструмента MCP и закрывается после
+chrome_idle_timeout секунд простоя — чтобы не занимать RAM открытым Chrome.
+
 Запуск:  python3 mcp_launcher.py [--config FILE] [--log-file FILE] [--autostart] [-s key=value ...]
 """
 from __future__ import annotations
@@ -46,7 +50,7 @@ from typing import Dict, List, Optional
 
 IS_WIN = os.name == "nt"
 LOCAL = "127.0.0.1"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger("launcher")
 
@@ -70,6 +74,10 @@ class Config:
     disable_gpu: bool = False
     start_url: str = ""
     chrome_extra_flags: str = ""       # произвольные флаги Chrome
+    chrome_lazy: bool = True           # запускать Chrome при первом вызове
+                                       # инструмента MCP и закрывать после простоя
+    chrome_idle_timeout: int = 180     # сек без вызовов инструментов до закрытия
+                                       # Chrome (0 = не закрывать автоматически)
     # --- MCP ---
     npx_path: str = ""                 # пусто = автопоиск
     mcp_package: str = "chrome-devtools-mcp@latest"
@@ -102,6 +110,8 @@ DESCR = {
     "disable_gpu": "добавить --disable-gpu",
     "start_url": "стартовая страница",
     "chrome_extra_flags": "произвольные флаги Chrome",
+    "chrome_lazy": "Chrome по требованию: старт при первом tools/call, авто-закрытие после простоя",
+    "chrome_idle_timeout": "сек без вызовов инструментов до авто-закрытия Chrome (0 = не закрывать)",
     "npx_path": "путь к npx (пусто = автопоиск)",
     "mcp_package": "npm-пакет MCP-сервера (берётся из кэша npx); путь/команда — запуск напрямую",
     "mcp_port": "порт, на котором слушает MCP (builtin-мост или supergateway)",
@@ -151,8 +161,10 @@ def set_value(cfg: Config, key: str, raw: str) -> None:
             raise LauncherError(f"{key}: ожидается целое число, получено {raw!r}")
         if key.endswith("_port") and not 1 <= val <= 65535:
             raise LauncherError(f"{key}: порт должен быть в диапазоне 1..65535")
-        if key.endswith("_timeout") and val < 1:
-            raise LauncherError(f"{key}: значение должно быть >= 1")
+        if key.endswith("_timeout"):
+            min_val = 0 if key == "chrome_idle_timeout" else 1  # 0 = отключить авто-закрытие
+            if val < min_val:
+                raise LauncherError(f"{key}: значение должно быть >= {min_val}")
     else:
         val = raw
     if key in CHOICES and val not in CHOICES[key]:
@@ -421,8 +433,10 @@ class BuiltinMcpBridge:
 
     WARMUP_PROTOCOL = "2025-11-25"
 
-    def __init__(self, mp: ManagedProcess):
+    def __init__(self, mp: ManagedProcess, launcher: Optional["Launcher"] = None):
         self.mp = mp
+        self.launcher = launcher                # для ленивого запуска Chrome
+        self.busy = 0                           # запросов в работе (idle-таймер не трогает)
         self.lock = threading.Lock()            # сериализует обмены с MCP-процессом
         self.cond = threading.Condition()
         self.pending: Dict[object, object] = {}  # id запроса -> 'sent' | ответ
@@ -509,6 +523,9 @@ class BuiltinMcpBridge:
                 out.append({"jsonrpc": "2.0", "id": m.get("id"),
                             "result": cached.get("result", {})})
             elif "id" in m:  # запрос -> переслать и дождаться ответа
+                if m["method"] == "tools/call" and self.launcher is not None:
+                    # ленивый Chrome: первый вызов инструмента поднимает браузер
+                    self.launcher.ensure_chrome_for_tools()
                 with self.cond:
                     self.pending[m["id"]] = "sent"
                 try:
@@ -560,12 +577,16 @@ class BuiltinMcpBridge:
                 if body is None:
                     self._reply(400, {"error": "Пустое тело запроса"})
                     return
-                with bridge.lock:
-                    try:
-                        resp = bridge.handle_messages(body)
-                    except LauncherError as e:
-                        self._reply(500, {"error": str(e)})
-                        return
+                bridge.busy += 1
+                try:
+                    with bridge.lock:
+                        try:
+                            resp = bridge.handle_messages(body)
+                        except LauncherError as e:
+                            self._reply(500, {"error": str(e)})
+                            return
+                finally:
+                    bridge.busy -= 1
                 if resp is None:
                     self._reply(202)
                 else:
@@ -607,6 +628,7 @@ class Launcher:
         self.chrome = ManagedProcess("chrome")
         self.mcp = ManagedProcess("mcp")
         self.bridge: Optional[BuiltinMcpBridge] = None
+        self._last_tool_ts = 0.0            # последнее обращение инструмента к Chrome
         self.lock = threading.RLock()
         self._down = False
         self._stop_evt = threading.Event()
@@ -704,6 +726,7 @@ class Launcher:
             except OSError as e:
                 raise LauncherError(f"Не удалось создать user_data_dir {c.user_data_dir}: {e}")
             self.chrome.start(self.chrome_cmd())
+            self._last_tool_ts = time.monotonic()  # отсчёт простоя ведём и от старта
             try:
                 self._wait_cdp()
             except BaseException:
@@ -734,7 +757,10 @@ class Launcher:
             if self.mcp.running:
                 log.info("MCP уже запущен (pid=%s)", self.mcp.pid)
                 return
-            if not self.chrome.running and not self.cdp_reachable():
+            if c.chrome_lazy and c.mcp_gateway != "builtin":
+                log.warning("chrome_lazy работает только с builtin-шлюзом: в supergateway-режиме "
+                            "Chrome нужно запускать вручную 'start chrome'")
+            if not c.chrome_lazy and not self.chrome.running and not self.cdp_reachable():
                 raise LauncherError("CDP недоступен. Сначала запустите Chrome: 'start chrome'.")
             if port_in_use(LOCAL, c.mcp_port):
                 raise LauncherError(f"Порт MCP {c.mcp_port} уже занят. Освободите его или 'set mcp_port N'.")
@@ -751,7 +777,7 @@ class Launcher:
                 log.warning("builtin-режим не поддерживает %s (опция действует только в supergateway)", key)
         self.mcp.start(self.builtin_child_cmd(), stdin_pipe=True)
         try:
-            self.bridge = BuiltinMcpBridge(self.mcp)
+            self.bridge = BuiltinMcpBridge(self.mcp, launcher=self)
             self.bridge.start_http(c.mcp_port)
             with self.bridge.lock:
                 self.bridge.ensure_initialized()  # прогрев: клиент получит ответ мгновенно
@@ -797,9 +823,23 @@ class Launcher:
         return f"http://{ip}:{c.mcp_port}{path}"
 
     # --- Общее ---
+    def ensure_chrome_for_tools(self) -> None:
+        """Ленивый запуск Chrome: вызывается мостом перед tools/call."""
+        with self.lock:
+            self._last_tool_ts = time.monotonic()
+            if self.chrome.running:
+                return
+            log.info("chrome_lazy: запускаю Chrome по запросу инструмента...")
+            self.start_chrome()  # ждёт готовности CDP; RLock реентерабелен
+
     def start(self, target: str = "all") -> None:
+        c = self.cfg
         if target in ("all", "chrome"):
-            self.start_chrome()
+            if target == "all" and c.chrome_lazy and c.mcp_gateway == "builtin":
+                log.info("chrome_lazy: Chrome запустится при первом вызове инструмента "
+                         "(авто-закрытие через %sс простоя)", c.chrome_idle_timeout or "выкл")
+            else:
+                self.start_chrome()
         if target in ("all", "mcp"):
             self.start_mcp()
 
@@ -842,6 +882,15 @@ class Launcher:
                               mp.name, p.returncode, "\n".join(mp.tail(8)) or "(пусто)")
                     if mp is self.chrome and self.mcp.running:
                         log.warning("Chrome упал, а MCP ещё работает — перезапустите: 'restart'")
+            # chrome_lazy: закрываем Chrome, если инструменты давно не обращались
+            c = self.cfg
+            if (c.chrome_lazy and c.chrome_idle_timeout > 0
+                    and self.chrome.running and self._last_tool_ts > 0
+                    and (self.bridge is None or self.bridge.busy == 0)
+                    and time.monotonic() - self._last_tool_ts > c.chrome_idle_timeout):
+                log.info("chrome_lazy: Chrome простаивал %sс — останавливаю для экономии RAM",
+                         c.chrome_idle_timeout)
+                self._safe_stop(self.chrome)
 
     def status(self) -> str:
         c = self.cfg
@@ -854,6 +903,10 @@ class Launcher:
         out = [line(self.chrome, c.cdp_port), line(self.mcp, c.mcp_port)]
         if self.mcp.running:
             out.append(f"endpoint: {self.endpoint()}")
+        if (self.chrome.running and c.chrome_lazy and c.chrome_idle_timeout > 0
+                and self._last_tool_ts > 0):
+            left = max(0, int(c.chrome_idle_timeout - (time.monotonic() - self._last_tool_ts)))
+            out.append(f"chrome_lazy: Chrome закроется через {left}с без вызовов инструментов")
         return "\n".join(out)
 
     def check(self) -> None:
@@ -862,7 +915,10 @@ class Launcher:
             info = http_get_json(f"http://{LOCAL}:{c.cdp_port}/json/version")
             log.info("CDP OK: %s | %s", info.get("Browser"), info.get("webSocketDebuggerUrl"))
         except (urllib.error.URLError, OSError, ValueError) as e:
-            log.error("CDP недоступен на порту %s: %s", c.cdp_port, e)
+            if c.chrome_lazy:
+                log.info("CDP не отвечает (норма для chrome_lazy — Chrome запустится по требованию): %s", e)
+            else:
+                log.error("CDP недоступен на порту %s: %s", c.cdp_port, e)
         if port_in_use(LOCAL, c.mcp_port):
             log.info("MCP: порт %s слушает", c.mcp_port)
             if c.mcp_health_endpoint:
@@ -934,6 +990,8 @@ HELP = """\
   set user_data_dir /tmp/chrome-profile2
   set mcp_log_level debug      # подробное логирование MCP-запросов
   set mcp_gateway supergateway # вместо встроенного HTTP-моста (нужен sse/ws/токен)
+  set chrome_idle_timeout 60   # закрыть Chrome после 60с без вызовов инструментов
+  set chrome_lazy off          # Chrome по 'start'/'stop' без авто-управления
 """
 
 
